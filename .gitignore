@@ -1,0 +1,14 @@
+
+# Entorno virtual de Python
+venv/
+.venv/
+
+# Archivos temporales de Python
+__pycache__/
+*.py[cod]
+
+# Archivos del sistema macOS
+.DS_Store
+
+# Configuración privada
+.streamlit/secrets.toml
