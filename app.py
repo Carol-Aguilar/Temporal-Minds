@@ -8,6 +8,8 @@ import streamlit as st
 import pandas as pd
 import io
 import matplotlib.pyplot as plt
+import numpy as np
+from statsmodels.tsa.api import VAR
 from pathlib import Path
 
 # ==========================================
@@ -20,6 +22,46 @@ st.set_page_config(
     layout="wide"
 )
 
+# ==========================================
+# FUNCIÓN PARA EJECUTAR MONTE CARLO
+# ==========================================
+
+def ejecutar_montecarlo(
+    ultimo_valor_trm,
+    media,
+    desviacion,
+    n_simulaciones,
+    horizonte,
+    semilla=42
+):
+
+    rng = np.random.default_rng(semilla)
+
+    rendimientos_simulados = rng.normal(
+        loc=media,
+        scale=desviacion,
+        size=(horizonte, n_simulaciones)
+    )
+
+    trayectorias = ultimo_valor_trm * np.exp(
+        np.cumsum(rendimientos_simulados, axis=0)
+    )
+
+    media_simulada = trayectorias.mean(axis=1)
+
+    p5 = np.percentile(trayectorias, 5, axis=1)
+    p50 = np.percentile(trayectorias, 50, axis=1)
+    p95 = np.percentile(trayectorias, 95, axis=1)
+
+    escenarios = pd.DataFrame({
+        "Dia": range(1, horizonte + 1),
+        "Media_TRM": media_simulada,
+        "Escenario_bajo_P5": p5,
+        "Escenario_central_P50": p50,
+        "Escenario_alto_P95": p95
+    })
+
+    return trayectorias, escenarios
 # ==========================================
 # 2. TÍTULO Y PRESENTACIÓN
 # ==========================================
@@ -499,6 +541,209 @@ if archivo.exists():
 
                 st.error("No se encontró el archivo de predicciones VAR.")
 
+            # ==========================================
+            # SIMULACIÓN INTERACTIVA DEL MODELO VAR
+            # ==========================================
+
+            st.divider()
+
+            st.write("### Simulación interactiva del modelo VAR")
+
+            st.write("""
+            En esta sección puedes modificar el número de rezagos
+            y el horizonte de proyección para generar nuevos
+            escenarios de la TRM mediante el modelo VAR.
+            """)
+
+            st.info(
+                "Esta simulación utiliza la base histórica completa "
+                "de 2016 a 2019. Los resultados originales del VAR(2) "
+                "se conservan sin modificaciones."
+            )
+
+            # Cargar nuevamente la base histórica completa
+            datos_var_interactivo = cargar_datos(str(archivo)).copy()
+
+            datos_var_interactivo = datos_var_interactivo.sort_values("Fecha")
+
+            # Preparar las cuatro variables originales
+            df_var_niveles = datos_var_interactivo.set_index("Fecha")[
+                [
+                    "TRM (COP/USD)",
+                    "Brent (USD/barril)",
+                    "DXY (índice)",
+                    "VIX (índice)"
+                ]
+            ].copy()
+
+            df_var_niveles.columns = ["TRM", "Brent", "DXY", "VIX"]
+
+            # Aplicar las transformaciones originales del VAR
+            df_var_interactivo = df_var_niveles.copy()
+
+            for variable in ["TRM", "Brent", "DXY"]:
+
+                if (df_var_interactivo[variable] <= 0).any():
+
+                    st.error(
+                        f"La variable {variable} contiene valores "
+                        "no positivos y no puede transformarse con logaritmos."
+                    )
+
+                    st.stop()
+
+                df_var_interactivo[variable] = np.log(
+                    df_var_interactivo[variable]
+                ).diff()
+
+            # El VIX permanece en niveles
+            df_var_interactivo = df_var_interactivo.dropna()
+
+            st.write("### Configuración de la simulación")
+
+            col_var1, col_var2 = st.columns(2)
+
+            with col_var1:
+
+                rezagos_var = st.slider(
+                    "Número de rezagos del modelo VAR",
+                    min_value=1,
+                    max_value=10,
+                    value=2,
+                    step=1
+                )
+
+            with col_var2:
+
+                horizonte_var = st.slider(
+                    "Horizonte de proyección (días hábiles)",
+                    min_value=5,
+                    max_value=90,
+                    value=30,
+                    step=5
+                )
+
+            st.caption(
+                "Los rezagos indican cuántos periodos anteriores utiliza "
+                "el modelo. El horizonte indica cuántos días hábiles "
+                "hacia adelante se proyectará la TRM."
+            )
+
+            if st.button("Ejecutar nueva simulación VAR"):
+
+                try:
+
+                    # Estimar el modelo VAR con los rezagos seleccionados
+                    modelo_var_interactivo = VAR(
+                        df_var_interactivo
+                    )
+
+                    resultado_var_interactivo = modelo_var_interactivo.fit(
+                        rezagos_var
+                    )
+
+                    # Obtener las últimas observaciones necesarias
+                    ultimos_datos_var = df_var_interactivo.values[
+                        -rezagos_var:
+                    ]
+
+                    # Generar pronósticos de las variables transformadas
+                    pronosticos_var = resultado_var_interactivo.forecast(
+                        y=ultimos_datos_var,
+                        steps=horizonte_var
+                    )
+
+                    # Recuperar el último valor histórico de la TRM
+                    ultimo_valor_trm_var = df_var_niveles["TRM"].iloc[-1]
+
+                    # Reconstruir la TRM en niveles
+                    trm_proyectada_var = (
+                        ultimo_valor_trm_var
+                        * np.exp(np.cumsum(pronosticos_var[:, 0]))
+                    )
+
+                    # Crear las fechas futuras
+                    ultima_fecha_var = df_var_niveles.index[-1]
+
+                    fechas_var = pd.bdate_range(
+                        start=ultima_fecha_var + pd.offsets.BDay(1),
+                        periods=horizonte_var
+                    )
+
+                    # Construir tabla de resultados
+                    resultados_var_interactivos = pd.DataFrame({
+                        "Fecha": fechas_var,
+                        "Dia": range(1, horizonte_var + 1),
+                        "TRM_predicha": trm_proyectada_var
+                    })
+
+                    st.success(
+                        "La nueva simulación VAR se ejecutó correctamente."
+                    )
+
+                    st.write("### Resultados de la nueva simulación VAR")
+
+                    st.dataframe(
+                        resultados_var_interactivos,
+                        width="stretch"
+                    )
+
+                    # Mostrar último valor proyectado
+                    st.metric(
+                        "TRM estimada al final del horizonte",
+                        f"${trm_proyectada_var[-1]:,.2f}"
+                    )
+
+                    # Construir gráfico
+                    fig_var_interactivo, ax_var_interactivo = plt.subplots(
+                        figsize=(12, 5)
+                    )
+
+                    # Mostrar últimos 60 datos históricos
+                    historico_var = df_var_niveles["TRM"].tail(60)
+
+                    ax_var_interactivo.plot(
+                        historico_var.index,
+                        historico_var.values,
+                        label="TRM histórica",
+                        color="steelblue"
+                    )
+
+                    ax_var_interactivo.plot(
+                        resultados_var_interactivos["Fecha"],
+                        resultados_var_interactivos["TRM_predicha"],
+                        label="Nueva proyección VAR",
+                        color="darkorange",
+                        marker="o"
+                    )
+
+                    ax_var_interactivo.set_title(
+                        f"Simulación interactiva de la TRM mediante VAR({rezagos_var})"
+                    )
+
+                    ax_var_interactivo.set_xlabel("Fecha")
+                    ax_var_interactivo.set_ylabel("TRM (COP/USD)")
+                    ax_var_interactivo.legend()
+                    ax_var_interactivo.grid(True)
+
+                    fig_var_interactivo.tight_layout()
+
+                    st.pyplot(fig_var_interactivo)
+
+                    plt.close(fig_var_interactivo)
+
+                    st.caption(
+                        "La proyección se reconstruye a partir de los "
+                        "rendimientos logarítmicos pronosticados por el VAR "
+                        "y del último valor histórico observado de la TRM."
+                    )
+
+                except Exception as error:
+
+                    st.error(
+                        f"No fue posible ejecutar la simulación VAR: {error}"
+                    )
+
         with tab2:
 
             st.write("### Cadenas de Markov")
@@ -568,9 +813,9 @@ if archivo.exists():
                 cuantiles de la distribución histórica:
 
                 - **Rendimiento bajo:** variaciones iguales o inferiores
-                  a -0,2425 %.
+                a -0,2425 %.
                 - **Rendimiento intermedio:** variaciones superiores a
-                  -0,2425 % e iguales o inferiores a 0,2315 %.
+                -0,2425 % e iguales o inferiores a 0,2315 %.
                 - **Rendimiento alto:** variaciones superiores a 0,2315 %.
 
                 Esta clasificación permite estudiar cómo cambia el
@@ -602,11 +847,11 @@ if archivo.exists():
                 horizontes de tiempo.
 
                 - A un día, las probabilidades dependen del último
-                  estado observado de la TRM.
+                estado observado de la TRM.
                 - A cinco días, las probabilidades comienzan a
-                  aproximarse a una distribución más equilibrada.
+                aproximarse a una distribución más equilibrada.
                 - A diez y veinte días, las probabilidades se
-                  estabilizan alrededor de un tercio para cada estado.
+                estabilizan alrededor de un tercio para cada estado.
 
                 Esto indica que, a medida que aumenta el horizonte,
                 la distribución proyectada tiende a perder la
@@ -628,12 +873,12 @@ if archivo.exists():
                 Los resultados muestran que:
 
                 - Cuando la TRM se encuentra en el estado bajo,
-                  tiene una probabilidad aproximada del 39,07 %
-                  de permanecer en ese estado.
+                tiene una probabilidad aproximada del 39,07 %
+                de permanecer en ese estado.
                 - Cuando se encuentra en el estado intermedio,
-                  tiene una probabilidad del 36,73 % de permanecer.
+                tiene una probabilidad del 36,73 % de permanecer.
                 - Cuando se encuentra en el estado alto,
-                  tiene una probabilidad del 40,40 % de permanecer.
+                tiene una probabilidad del 40,40 % de permanecer.
 
                 Estas probabilidades indican que existe cierta
                 persistencia en los estados, aunque también hay
@@ -696,6 +941,138 @@ if archivo.exists():
         with tab3:
 
             st.write("### Simulación de Monte Carlo")
+            st.write("### Configuración de la simulación")
+
+            # Cargar la base histórica completa
+            datos_mc = cargar_datos(str(archivo))
+
+            # Calcular parámetros históricos
+            retornos_mc = np.log(
+                datos_mc["TRM (COP/USD)"]
+            ).diff().dropna()
+
+            media_historica = retornos_mc.mean()
+            desviacion_historica = retornos_mc.std()
+
+            ultimo_valor_trm = datos_mc["TRM (COP/USD)"].iloc[-1]
+
+            st.write(
+                "Modifica los siguientes valores para generar "
+                "nuevos escenarios de la TRM."
+            )
+
+            n_simulaciones = st.slider(
+                "Número de simulaciones",
+                min_value=100,
+                max_value=10000,
+                value=1000,
+                step=100
+            )
+
+            horizonte = st.slider(
+                "Horizonte de proyección (días)",
+                min_value=5,
+                max_value=90,
+                value=30,
+                step=5
+            )
+
+            st.write("### Parámetros históricos")
+
+            col1, col2 = st.columns(2)
+
+            col1.metric(
+                "Media diaria histórica",
+                f"{media_historica:.6f}"
+            )
+
+            col2.metric(
+                "Desviación estándar histórica",
+                f"{desviacion_historica:.6f}"
+            )
+
+            st.caption(
+                "Los parámetros estadísticos se calculan "
+                "con la base histórica completa de 2016 a 2019."
+            )
+
+            if st.button("Ejecutar nueva simulación Monte Carlo"):
+
+                trayectorias_nuevas, escenarios_nuevos = ejecutar_montecarlo(
+                    ultimo_valor_trm,
+                    media_historica,
+                    desviacion_historica,
+                    n_simulaciones,
+                    horizonte
+                )
+
+                st.success("Simulación ejecutada correctamente.")
+
+                st.write("### Resultados de la nueva simulación")
+
+                st.dataframe(
+                    escenarios_nuevos,
+                    width="stretch"
+                )
+
+                fig_nueva, ax_nueva = plt.subplots(figsize=(12, 5))
+
+                ax_nueva.plot(
+                    escenarios_nuevos["Dia"],
+                    escenarios_nuevos["Media_TRM"],
+                    label="Media simulada"
+                )
+
+                ax_nueva.plot(
+                    escenarios_nuevos["Dia"],
+                    escenarios_nuevos["Escenario_central_P50"],
+                    label="Escenario central (P50)",
+                    linestyle="--"
+                )
+
+                ax_nueva.fill_between(
+                    escenarios_nuevos["Dia"],
+                    escenarios_nuevos["Escenario_bajo_P5"],
+                    escenarios_nuevos["Escenario_alto_P95"],
+                    alpha=0.25,
+                    label="Intervalo P5-P95"
+                )
+
+                ax_nueva.set_title("Nueva simulación Monte Carlo de la TRM")
+                ax_nueva.set_xlabel("Días de proyección")
+                ax_nueva.set_ylabel("TRM (COP/USD)")
+                ax_nueva.legend()
+                ax_nueva.grid(True)
+
+                fig_nueva.tight_layout()
+
+                st.pyplot(fig_nueva)
+
+                plt.close(fig_nueva)
+
+                st.write("### Escenarios al último día")
+
+                ultimo = escenarios_nuevos.iloc[-1]
+
+                st.metric(
+                    "Media simulada",
+                    f"${ultimo['Media_TRM']:,.2f}"
+                )
+
+                st.metric(
+                    "Escenario bajo (P5)",
+                    f"${ultimo['Escenario_bajo_P5']:,.2f}"
+                )
+
+                st.metric(
+                    "Escenario central (P50)",
+                    f"${ultimo['Escenario_central_P50']:,.2f}"
+                )
+
+                st.metric(
+                    "Escenario alto (P95)",
+                    f"${ultimo['Escenario_alto_P95']:,.2f}"
+                )
 
             st.write("""
             **Objetivo del modelo**
@@ -722,6 +1099,12 @@ if archivo.exists():
             - Escenarios posibles.
             - Interpretación de la incertidumbre.
             """)
+        
+            # ==========================================
+            # RESULTADOS ORIGINALES DE MONTE CARLO
+            # ==========================================
+
+            st.write("### Resultados originales del proyecto")
 
             archivo_montecarlo = carpeta_proyecto / "Resultados_MonteCarlo_TRM.xlsx"
 
@@ -732,75 +1115,15 @@ if archivo.exists():
                     sheet_name="Escenarios"
                 )
 
-                st.success("Resultados de Monte Carlo cargados correctamente.")
-
-                st.write("### Escenarios futuros de la TRM")
-
-                st.write("""
-                La simulación Monte Carlo genera 1.000 trayectorias
-                posibles para analizar la incertidumbre de la TRM
-                durante un horizonte de 30 días.
-                """)
+                st.success("Resultados originales cargados correctamente.")
 
                 st.info(
-                    "Nota metodológica: la simulación utiliza "
-                    "información histórica de 2016 a 2019 y parte "
-                    "del último valor observado de la TRM al cierre "
-                    "de 2019. Por tanto, no representa un pronóstico "
-                    "actualizado para 2026."
+                    "Estos son los resultados originales del proyecto: "
+                    "1.000 trayectorias y un horizonte de 30 días, "
+                    "calculados con información histórica de 2016 a 2019."
                 )
 
-                st.write("### ¿Cómo funciona la simulación?")
-
-                st.markdown("""
-                El modelo genera múltiples trayectorias posibles
-                de la TRM mediante rendimientos aleatorios.
-
-                Para ello utiliza:
-
-                - **1.000 simulaciones:** cada una representa una
-                  posible trayectoria.
-                - **Horizonte de 30 días:** periodo durante el cual
-                  se proyectan las trayectorias.
-                - **Media histórica:** representa el rendimiento
-                  promedio utilizado en la simulación.
-                - **Desviación estándar histórica:** representa
-                  la variabilidad de los rendimientos.
-
-                El modelo supone que los rendimientos siguen una
-                distribución normal y son independientes entre
-                periodos, con media y desviación estándar constantes.
-                Estos son supuestos de simulación, no condiciones
-                que necesariamente se cumplan en el mercado.
-                """)
-
-                
-                st.markdown("""
-                ### Interpretación de los escenarios
-
-                Los resultados se presentan mediante tres percentiles:
-
-                - **P5 (escenario bajo):** representa el valor por
-                  debajo del cual se encuentra el 5 % de las
-                  trayectorias simuladas.
-                - **P50 (escenario central):** corresponde a la
-                  mediana; la mitad de las trayectorias queda por
-                  debajo de este valor y la otra mitad por encima.
-                - **P95 (escenario alto):** representa el valor por
-                  debajo del cual se encuentra el 95 % de las
-                  trayectorias simuladas.
-
-                En conjunto, P5 y P95 permiten observar un intervalo
-                central que contiene aproximadamente el 90 % de los
-                resultados simulados.
-
-                Estos escenarios permiten analizar la incertidumbre
-                y la dispersión de los posibles valores de la TRM.
-                No representan límites garantizados ni predicciones
-                exactas.
-                """)
-
-                st.write("### Gráfico de escenarios simulados")
+                st.write("### Gráfico original de escenarios")
 
                 fig_mc, ax_mc = plt.subplots(figsize=(12, 5))
 
@@ -828,7 +1151,7 @@ if archivo.exists():
                     label="Escenario alto (P95)"
                 )
 
-                ax_mc.set_title("Simulación Monte Carlo de la TRM")
+                ax_mc.set_title("Resultados originales de Monte Carlo")
                 ax_mc.set_xlabel("Días de proyección")
                 ax_mc.set_ylabel("TRM (COP/USD)")
                 ax_mc.legend()
@@ -837,18 +1160,21 @@ if archivo.exists():
                 fig_mc.tight_layout()
 
                 st.pyplot(fig_mc)
-                st.write("### Tabla de resultados de Monte Carlo")
+                plt.close(fig_mc)
+
+                st.write("### Tabla original de resultados")
 
                 st.dataframe(
                     escenarios_mc,
                     width="stretch"
                 )
 
-                plt.close(fig_mc)
-
             else:
 
-                st.error("No se encontró el archivo de resultados de Monte Carlo.")
+                st.warning(
+                    "No se encontró el archivo de resultados originales "
+                    "de Monte Carlo."
+                )
 
         # ==========================================
                 # 11. CONCLUSIONES INTEGRADAS
